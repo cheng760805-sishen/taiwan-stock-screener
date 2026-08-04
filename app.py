@@ -14,8 +14,7 @@ st.set_page_config(
 
 st.title("🌐 台股上市全市場 KD & RSI 彈性自訂條件篩選器")
 st.caption(
-    "自動串接證交所 API 讀取全上市股票 ｜ 支援側邊欄自由調整 KD/RSI"
-    " 參數與門檻"
+    "自動串接證交所 API 讀取全上市股票 ｜ 支援側邊欄自由調整 KD/RSI 參數與門檻"
 )
 
 # 2. 側邊欄：自訂指標參數與門檻控制區
@@ -51,13 +50,13 @@ with st.sidebar.expander("📈 RSI 指標週期設定", expanded=True):
 st.sidebar.header("🎯 2. 篩選門檻條件設定")
 
 k_threshold = st.sidebar.slider(
-    "K 值低於 (超跌門檻)", min_value=5, max_value=50, value=25, step=1
+    "K 值低於 (超跌門檻)", min_value=5, max_value=95, value=25, step=1
 )
 rsi_s_threshold = st.sidebar.slider(
-    f"RSI({rsi_short}) 低於", min_value=5, max_value=50, value=25, step=1
+    f"RSI({rsi_short}) 低於", min_value=5, max_value=95, value=25, step=1
 )
 rsi_l_threshold = st.sidebar.slider(
-    f"RSI({rsi_long}) 低於", min_value=5, max_value=50, value=25, step=1
+    f"RSI({rsi_long}) 低於", min_value=5, max_value=95, value=25, step=1
 )
 
 only_matched = st.sidebar.checkbox("僅顯示符合條件的股票", value=True)
@@ -84,7 +83,22 @@ def get_all_twse_stocks():
     ]
 
 
-# 4. 動態技術指標計算邏輯
+# 4. 萬能股票 K 線欄位擷取函數（解決 MultiIndex 錯位問題）
+def extract_stock_df(df_data, ticker_symbol):
+  if not isinstance(df_data.columns, pd.MultiIndex):
+    return df_data.copy()
+
+  # 第一層是股票代號 (Level 0)
+  if ticker_symbol in df_data.columns.get_level_values(0):
+    return df_data[ticker_symbol].copy()
+  # 第一層是價格種類，第二層是股票代號 (Level 1)
+  elif ticker_symbol in df_data.columns.get_level_values(1):
+    return df_data.xs(ticker_symbol, axis=1, level=1).copy()
+  else:
+    return pd.DataFrame()
+
+
+# 5. 動態技術指標計算邏輯
 def calculate_kd_rsi(df, kd_p, k_s, d_s, r_short, r_long):
   delta = df["Close"].diff()
   gain = delta.where(delta > 0, 0)
@@ -104,7 +118,6 @@ def calculate_kd_rsi(df, kd_p, k_s, d_s, r_short, r_long):
   df["RSV"] = (df["Close"] - low_min) / (high_max - low_min) * 100
   df["RSV"] = df["RSV"].fillna(50)
 
-  # 計算平滑權重：預設 k_s = 3，即 (2/3)*K_prev + (1/3)*RSV
   k_w1, k_w2 = (k_s - 1) / k_s, 1 / k_s
   d_w1, d_w2 = (d_s - 1) / d_s, 1 / d_s
 
@@ -120,7 +133,7 @@ def calculate_kd_rsi(df, kd_p, k_s, d_s, r_short, r_long):
   return df
 
 
-# 5. 主程式掃描邏輯
+# 6. 主程式掃描邏輯
 all_stocks = get_all_twse_stocks()
 st.sidebar.info(f"目前證交所共載入：**{len(all_stocks)}** 檔上市股票")
 
@@ -147,61 +160,62 @@ if st.button(
     )
 
     try:
-      data = yf.download(
-          tickers, period="3m", group_by="ticker", progress=False
-      )
+      # 批次抓取市場資料
+      data = yf.download(tickers, period="3m", progress=False)
 
       for s in chunk:
-        code = s["Code"]
-        name = s["Name"]
-        ticker = f"{code}.TW"
+        try:
+          code = s["Code"]
+          name = s["Name"]
+          ticker = f"{code}.TW"
 
-        if len(chunk) == 1:
-          df_stock = data.copy()
-        elif ticker in data.columns.levels[0]:
-          df_stock = data[ticker].dropna(how="all")
-        else:
+          # 提取單檔股票 DataFrame
+          df_stock = extract_stock_df(data, ticker).dropna(how="all")
+
+          if df_stock.empty or len(df_stock) < max(kd_period, rsi_long) + 5:
+            continue
+
+          # 確保欄位名稱正確
+          if isinstance(df_stock.columns, pd.MultiIndex):
+            df_stock.columns = df_stock.columns.get_level_values(0)
+
+          df_calc = calculate_kd_rsi(
+              df_stock,
+              kd_period,
+              k_smooth,
+              d_smooth,
+              rsi_short,
+              rsi_long,
+          )
+          latest = df_calc.iloc[-1]
+
+          k = float(latest["K"])
+          d = float(latest["D"])
+          r_s = float(latest[f"RSI_{rsi_short}"])
+          r_l = float(latest[f"RSI_{rsi_long}"])
+          close_p = float(latest["Close"])
+
+          # 判斷門檻
+          is_matched = (
+              k < k_threshold
+              and r_s < rsi_s_threshold
+              and r_l < rsi_l_threshold
+          )
+
+          if not only_matched or is_matched:
+            results.append({
+                "股票代號": code,
+                "股票名稱": name,
+                "收盤價": round(close_p, 2),
+                f"K({kd_period})": round(k, 2),
+                f"D({kd_period})": round(d, 2),
+                f"RSI({rsi_short})": round(r_s, 2),
+                f"RSI({rsi_long})": round(r_l, 2),
+                "狀態": "🎯 符合自訂條件" if is_matched else "觀察中",
+            })
+        except Exception:
           continue
-
-        if df_stock.empty or len(df_stock) < max(kd_period, rsi_long) + 5:
-          continue
-
-        if isinstance(df_stock.columns, pd.MultiIndex):
-          df_stock.columns = df_stock.columns.get_level_values(0)
-
-        df_calc = calculate_kd_rsi(
-            df_stock,
-            kd_period,
-            k_smooth,
-            d_smooth,
-            rsi_short,
-            rsi_long,
-        )
-        latest = df_calc.iloc[-1]
-
-        k = float(latest["K"])
-        d = float(latest["D"])
-        r_s = float(latest[f"RSI_{rsi_short}"])
-        r_l = float(latest[f"RSI_{rsi_long}"])
-        close_p = float(latest["Close"])
-
-        # 動態判斷符合條件
-        is_matched = (
-            k < k_threshold and r_s < rsi_s_threshold and r_l < rsi_l_threshold
-        )
-
-        if not only_matched or is_matched:
-          results.append({
-              "股票代號": code,
-              "股票名稱": name,
-              "收盤價": round(close_p, 2),
-              f"K({kd_period})": round(k, 2),
-              f"D({kd_period})": round(d, 2),
-              f"RSI({rsi_short})": round(r_s, 2),
-              f"RSI({rsi_long})": round(r_l, 2),
-              "狀態": "🎯 符合自訂條件" if is_matched else "觀察中",
-          })
-    except Exception as e:
+    except Exception:
       continue
 
   progress_bar.empty()
@@ -211,7 +225,7 @@ if st.button(
     res_df = pd.DataFrame(results)
 
     col1, col2 = st.columns(2)
-    col1.metric("已掃描標的數", f"{total_stocks} 檔")
+    col1.metric("已成功掃描標的", f"{len(res_df)} 檔")
     matched_count = len(res_df[res_df["狀態"] == "🎯 符合自訂條件"])
     col2.metric("符合條件個股", f"{matched_count} 檔")
 
