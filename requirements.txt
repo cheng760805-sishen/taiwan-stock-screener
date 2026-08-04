@@ -1,5 +1,3 @@
 FinMind
-
 streamlit
-yfinance
 pandas
